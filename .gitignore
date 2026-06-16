@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.bak
+*.old
+platform-tools.zip
+*.log
+*.tmp
+.tmp/
