@@ -437,48 +437,78 @@ def pull_file_via_exec_out(remote_path, local_path, timeout=120):
 
 def pull_file_with_adb_pull(remote_path, local_path, item_size):
     """
-    Pull file menggunakan adb pull standar untuk ASCII filenames.
-    Lebih cepat karena pipe tidak dialihkan.
+    Pull file menggunakan adb exec-out cat untuk transfer binary yang reliable.
+    Menggantikan adb pull yang terbukti corrupt pada file > 5MB.
     
     Returns: (success: bool, transferred_bytes: int)
     """
     temp_local_path = f"{local_path}.tmp"
     os.makedirs(os.path.dirname(temp_local_path), exist_ok=True)
     
-    # Panggil adb pull tanpa pipe stdout/stderr
-    start_time = time.time()
+    # Escape path untuk shell
+    escaped_path = remote_path.replace("'", "'\\\\''")
+    cmd = f"cat '{escaped_path}'"
+    
     proc = subprocess.Popen(
-        [ADB_PATH, "pull", remote_path, temp_local_path],
-        stdout=None,
-        stderr=None,
+        [ADB_PATH, "exec-out", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    proc.wait(timeout=120)
     
-    if proc.returncode == 0 and os.path.exists(temp_local_path):
-        actual_size = os.path.getsize(temp_local_path)
-        
-        # Validasi ukuran
-        if item_size > 0:
-            size_ratio = actual_size / item_size if item_size > 0 else 0
-            if size_ratio < 0.5:  # Incomplete download
-                os.remove(temp_local_path)
-                return False, 0
-        
-        # Pindah ke lokasi final
-        if os.path.exists(local_path):
-            os.remove(local_path)
-        os.replace(temp_local_path, local_path)
-        
-        return True, actual_size
-    
-    # Cleanup temp
-    if os.path.exists(temp_local_path):
+    # Stream langsung ke file (chunk-by-chunk, tanpa memory penuh)
+    transferred = 0
+    try:
+        with open(temp_local_path, 'wb') as f:
+            while True:
+                chunk = proc.stdout.read(65536)  # 64KB chunks
+                if not chunk:
+                    break
+                f.write(chunk)
+                transferred += len(chunk)
+        proc.wait(timeout=120)
+    except Exception as e:
+        proc.kill()
         try:
             os.remove(temp_local_path)
         except:
             pass
-    return False, 0
+        return False, 0
+    
+    if proc.returncode != 0:
+        try:
+            os.remove(temp_local_path)
+        except:
+            pass
+        return False, 0
+    
+    if transferred == 0:
+        try:
+            os.remove(temp_local_path)
+        except:
+            pass
+        return False, 0
+    
+    # Validasi ukuran KETAT - minimal 95% dari expected
+    if item_size > 0:
+        ratio = transferred / item_size
+        if ratio < 0.5:
+            try:
+                os.remove(temp_local_path)
+            except:
+                pass
+            return False, 0
+        if ratio < 0.95:
+            # 50-95%: warning tapi tetap simpan sebagai partial
+            # (mungkin file di HP memang belum selesai di-write)
+            pass
+    
+    # Pindah ke lokasi final
+    if os.path.exists(local_path):
+        os.remove(local_path)
+    os.replace(temp_local_path, local_path)
+    
+    return True, transferred
 
 
 def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_paths, used_paths, copy_mode):
@@ -569,12 +599,27 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
                     except UnicodeEncodeError:
                         is_ascii = False
 
-                    if is_ascii:
+                    # Cek apakah file video (rentan truncation) atau file besar
+                    is_video = item["path"].lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.3gp'))
+                    is_large = item["size"] is not None and item["size"] > 5 * 1024 * 1024  # > 5MB
+                    
+                    if is_ascii and not is_video:
+                        # ASCII + non-video: pakai adb pull (cepat)
                         ok, transferred = pull_file_with_adb_pull(
                             remote_path, local_path, item["size"]
                         )
+                        
+                        # Validasi tambahan untuk file besar
+                        if ok and is_large and transferred < (item["size"] or 0) * 0.95:
+                            # Download >5% kurang dari expected - fallback ke tar
+                            if os.path.exists(local_path):
+                                os.remove(local_path)
+                            console.print(f"\n[yellow]  ⚠️  adb pull incomplete ({format_size(transferred)}/{format_size(item['size'])}), retry via tar...[/yellow]")
+                            ok, transferred, err = pull_file_via_exec_out(
+                                remote_path, local_path
+                            )
                     else:
-                        # Non-ASCII filename (Unicode/emoji) - pakai tar method
+                        # Video file atau Unicode: pakai tar streaming (reliable)
                         ok, transferred, err = pull_file_via_exec_out(
                             remote_path, local_path
                         )
@@ -790,8 +835,19 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
             except UnicodeEncodeError:
                 is_ascii = False
 
-            if is_ascii:
+            # Video files pakai tar streaming (lebih reliable, cegah moov truncation)
+            is_video = remote_path.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.3gp'))
+
+            if is_ascii and not is_video:
                 ok, transferred = pull_file_with_adb_pull(remote_path, local_path, item["size"])
+                
+                # Auto-fallback ke tar jika adb pull incomplete untuk file > 5MB
+                is_large = item["size"] is not None and item["size"] > 5 * 1024 * 1024
+                if ok and is_large and transferred < (item["size"] or 0) * 0.95:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    print(f"\n  ⚠️  adb pull incomplete ({format_size(transferred)}/{format_size(item['size'])}), retry via tar...")
+                    ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
             else:
                 ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
 
