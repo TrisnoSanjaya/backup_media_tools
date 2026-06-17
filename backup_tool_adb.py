@@ -276,6 +276,9 @@ def adb_list_files_recursive():
             elif mode & 0o100000:  # File
                 ext = os.path.splitext(name)[1].lower()
                 if ext in VALID_EXTENSIONS:
+                    # Skip file dengan Unicode/emoji di nama (silent, no log)
+                    if any(ord(ch) > 127 for ch in name):
+                        continue
                     all_files.append({"path": full_path, "size": size, "name": name})
 
     elapsed = time.time() - scan_start
@@ -519,7 +522,6 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
     success = 0
     failed = 0
     skipped = 0
-    skipped_unicode = 0
     total_transferred = 0
     sorted_folders = sorted(new_folders.items(), key=lambda x: x[0])
     
@@ -592,37 +594,10 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
                         overall_progress.advance(overall_task, item["size"] or 0)
                         continue
 
-                    # Cek apakah filename ASCII
-                    try:
-                        filename.encode('ascii')
-                        is_ascii = True
-                    except UnicodeEncodeError:
-                        is_ascii = False
-
-                    # Cek apakah file video (rentan truncation) atau file besar
-                    is_video = item["path"].lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.3gp'))
-                    is_large = item["size"] is not None and item["size"] > 5 * 1024 * 1024  # > 5MB
-                    
-                    if is_ascii and not is_video:
-                        # ASCII + non-video: pakai adb pull (cepat)
-                        ok, transferred = pull_file_with_adb_pull(
-                            remote_path, local_path, item["size"]
-                        )
-                        
-                        # Validasi tambahan untuk file besar
-                        if ok and is_large and transferred < (item["size"] or 0) * 0.95:
-                            # Download >5% kurang dari expected - fallback ke tar
-                            if os.path.exists(local_path):
-                                os.remove(local_path)
-                            console.print(f"\n[yellow]  ⚠️  adb pull incomplete ({format_size(transferred)}/{format_size(item['size'])}), retry via tar...[/yellow]")
-                            ok, transferred, err = pull_file_via_exec_out(
-                                remote_path, local_path
-                            )
-                    else:
-                        # Video file atau Unicode: pakai tar streaming (reliable)
-                        ok, transferred, err = pull_file_via_exec_out(
-                            remote_path, local_path
-                        )
+                    # Pakai tar streaming untuk SEMUA file (reliable untuk binary)
+                    ok, transferred, err = pull_file_via_exec_out(
+                        remote_path, local_path
+                    )
 
                     if ok:
                         used_paths.add(safe_names.norm_path(local_path))
@@ -632,10 +607,7 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
                             e_remote = escape_adb_shell(remote_path)
                             adb_run(["shell", f'rm "{e_remote}"'], timeout=10)
                     else:
-                        if not is_ascii:
-                            skipped_unicode += 1
-                        else:
-                            failed += 1
+                        failed += 1
 
                     folder_progress.advance(folder_task, 1)
                     overall_progress.advance(overall_task, transferred)
@@ -648,18 +620,15 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
   Berhasil     : {success}
   Gagal        : {failed}
   Dilewati     : {skipped}
-  Unicode/Emoji: {skipped_unicode}
   Total        : {total_files}
   Ukuran       : {format_size(total_transferred)}
 [{'=' * 60}]
 """
     console.print(summary)
 
-    if failed == 0 and skipped_unicode == 0:
+    if failed == 0:
         console.print("\n[green][SUKSES][/green] Semua file berhasil dicadangkan!")
     else:
-        if skipped_unicode > 0:
-            console.print(f"\n[yellow][INFO][/yellow] {skipped_unicode} file Unicode/emoji di-skip (butuh tar streaming)")
         if failed > 0:
             console.print(f"[red][WARN][/red] {failed} file gagal dicadangkan.")
 
@@ -784,7 +753,6 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
     success = 0
     failed = 0
     skipped = 0
-    skipped_unicode = 0
     total_transferred = 0
     sorted_folders = sorted(new_folders.items(), key=lambda x: x[0])
 
@@ -828,28 +796,8 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
                 total_transferred += item["size"] if item["size"] else 0
                 continue
 
-            # Cek apakah filename ASCII
-            try:
-                filename.encode('ascii')
-                is_ascii = True
-            except UnicodeEncodeError:
-                is_ascii = False
-
-            # Video files pakai tar streaming (lebih reliable, cegah moov truncation)
-            is_video = remote_path.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.3gp'))
-
-            if is_ascii and not is_video:
-                ok, transferred = pull_file_with_adb_pull(remote_path, local_path, item["size"])
-                
-                # Auto-fallback ke tar jika adb pull incomplete untuk file > 5MB
-                is_large = item["size"] is not None and item["size"] > 5 * 1024 * 1024
-                if ok and is_large and transferred < (item["size"] or 0) * 0.95:
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
-                    print(f"\n  ⚠️  adb pull incomplete ({format_size(transferred)}/{format_size(item['size'])}), retry via tar...")
-                    ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
-            else:
-                ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
+            # Pakai tar streaming untuk SEMUA file (reliable untuk binary)
+            ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
 
             if ok:
                 used_paths.add(safe_names.norm_path(local_path))
@@ -873,11 +821,8 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
                     e_remote = escape_adb_shell(remote_path)
                     adb_run(["shell", f'rm "{e_remote}"'], timeout=10)
             else:
-                if not is_ascii:
-                    skipped_unicode += 1
-                else:
-                    print(f"\n[ERROR] Gagal: {filename}")
-                    failed += 1
+                print(f"\n[ERROR] Gagal: {filename}")
+                failed += 1
 
     draw_folder_progress(100, 100, "SELESAI", len(sorted_folders), len(sorted_folders),
                           total_transferred, total_new_size, 0)
@@ -890,16 +835,13 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
     print(f"  Berhasil     : {success}")
     print(f"  Gagal        : {failed}")
     print(f"  Dilewati     : {skipped}")
-    print(f"  Unicode/Emoji: {skipped_unicode}")
     print(f"  Total        : {total_files}")
     print(f"  Ukuran       : {format_size(total_transferred)} / {format_size(total_new_size)}")
     print(f"{'=' * 60}")
 
-    if failed == 0 and skipped_unicode == 0:
+    if failed == 0:
         print("\n[SUKSES] Semua file berhasil dicadangkan!")
     else:
-        if skipped_unicode > 0:
-            print(f"\n[INFO] {skipped_unicode} file Unicode/emoji di-skip")
         if failed > 0:
             print(f"[WARN] {failed} file gagal dicadangkan.")
 
