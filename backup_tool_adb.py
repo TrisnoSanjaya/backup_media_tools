@@ -14,6 +14,8 @@ import io
 import tarfile
 from ctypes import wintypes
 
+import webbrowser
+
 import safe_names
 
 # ============================================================================
@@ -1310,6 +1312,38 @@ def main():
         _input("       Tekan Enter untuk keluar...")
         sys.exit(1)
     _print(f"[ADB] ADB siap: {adb_path}\n", style="green" if _RICH else None)
+
+    # --- Menu Utama ---
+    while True:
+        if _RICH:
+            _console.print(_Panel(
+                "  [bold cyan]1[/bold cyan]. Mulai Backup\n"
+                "  [bold cyan]2[/bold cyan]. Donasi \u2615\n"
+                "  [bold cyan]3[/bold cyan]. Keluar",
+                title="MENU UTAMA",
+                border_style="cyan",
+            ))
+        else:
+            _rule("MENU UTAMA")
+            _print("  1. Mulai Backup")
+            _print("  2. Donasi \u2615")
+            _print("  3. Keluar")
+
+        pilihan = _input("\n  Pilih [1/2/3]: ").strip()
+        if pilihan == "1":
+            break
+        elif pilihan == "2":
+            _print("\n  Terima kasih atas dukungannya! \u2615", style="bold yellow" if _RICH else None)
+            _print(f"  Membuka: https://sociabuzz.com/trisnosanjaya\n")
+            webbrowser.open("https://sociabuzz.com/trisnosanjaya")
+            _print("  [ENTER] untuk kembali ke menu...")
+            _input("")
+            continue
+        elif pilihan == "3":
+            _print("\n[EXIT] Program dihentikan.", style="yellow" if _RICH else None)
+            sys.exit(0)
+        else:
+            _print("  Input tidak valid. Pilih 1, 2, atau 3.", style="red" if _RICH else None)
 
     try:
         while True:
