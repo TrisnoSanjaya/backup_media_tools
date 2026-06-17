@@ -10,10 +10,8 @@ import os
 import subprocess
 import sys
 import time
-import io
 import tarfile
 from ctypes import wintypes
-from pathlib import Path
 
 import safe_names
 
@@ -191,14 +189,24 @@ def check_adb():
 
 def wait_for_device():
     """Tunggu hingga HP Android terhubung via USB."""
-    print("\\n[IDLE] Menunggu HP Android terhubung via USB...")
-    print("       Pastikan USB Debugging sudah aktif dan HP terhubung.\\n")
+    if RICH_AVAILABLE:
+        console.print("\n[dim]Menunggu HP Android terhubung via USB...[/dim]")
+        console.print("[dim]  Pastikan USB Debugging sudah aktif dan HP terhubung.[/dim]\n")
+    else:
+        print("\n[IDLE] Menunggu HP Android terhubung via USB...")
+        print("       Pastikan USB Debugging sudah aktif dan HP terhubung.\n")
     while True:
         ok, info = check_adb()
         if ok:
-            print(f"[FOUND] Device terdeteksi: {info}")
+            if RICH_AVAILABLE:
+                console.print(f"[green]✓ Device terdeteksi:[/green] [bold]{info}[/bold]")
+            else:
+                print(f"[FOUND] Device terdeteksi: {info}")
             return info
-        print(f"[IDLE] {info}. Mengecek ulang dalam {POLL_INTERVAL} detik...")
+        if RICH_AVAILABLE:
+            console.print(f"[yellow]⏳[/yellow] {info}. Mengecek ulang...", end=" ")
+        else:
+            print(f"[IDLE] {info}. Mengecek ulang dalam {POLL_INTERVAL} detik...")
         try:
             choice = (
                 input(
@@ -208,7 +216,10 @@ def wait_for_device():
                 .upper()
             )
             if choice == "M":
-                print("       Menunggu device... (colokin HP jika belum)")
+                if RICH_AVAILABLE:
+                    console.print("[dim]Menunggu device... (colokin HP jika belum)[/dim]")
+                else:
+                    print("       Menunggu device... (colokin HP jika belum)")
                 time.sleep(POLL_INTERVAL)
         except EOFError:
             pass
@@ -233,64 +244,95 @@ def format_size(size_bytes):
 
 
 def adb_list_files_recursive():
-    """Scan semua file media di HP dengan optimasi stack-based iteration."""
+    """Scan semua file media di HP dengan stack-based traversal."""
     all_files = []
     seen_paths = set()
 
     if RICH_AVAILABLE:
-        console.print("[SCAN] Melakukan deep scan via ADB (direct listing)...")
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        spinner = Progress(
+            SpinnerColumn(spinner_name="dots"),
+            TextColumn("[cyan]Scanning HP...[/cyan] {task.description}"),
+            transient=True,
+            console=console,
+        )
+        with spinner:
+            task = spinner.add_task("", total=None)
+            scan_start = time.time()
+            stack = list(SCAN_PATHS)
+
+            while stack:
+                current_path = stack.pop()
+                spinner.update(task, description=current_path[-40:])
+                stdout, stderr, rc = adb_run(["ls", current_path], timeout=60)
+                if rc != 0 or not stdout:
+                    continue
+
+                for line in stdout.splitlines():
+                    parts = line.split(maxsplit=3)
+                    if len(parts) < 4:
+                        continue
+                    mode_str, size_str, _, name = parts
+                    if name in (".", ".."):
+                        continue
+                    full_path = f"{current_path.rstrip('/')}/{name}"
+                    if full_path in seen_paths:
+                        continue
+                    seen_paths.add(full_path)
+                    try:
+                        mode = int(mode_str, 16)
+                        size = int(size_str, 16)
+                    except ValueError:
+                        continue
+                    if mode & 0o40000:
+                        stack.append(full_path)
+                    elif mode & 0o100000:
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext in VALID_EXTENSIONS:
+                            if any(ord(ch) > 127 for ch in name):
+                                continue
+                            all_files.append({"path": full_path, "size": size, "name": name})
+
+            elapsed = time.time() - scan_start
+        console.print(f"  [green]✓ Scan selesai dalam {elapsed:.1f} detik[/green]")
+        console.print(f"  [cyan]Total file media ditemukan: {len(all_files)}[/cyan]")
     else:
         print("[SCAN] Melakukan deep scan via ADB (direct listing)...")
-
-    scan_start = time.time()
-    stack = list(SCAN_PATHS)
-
-    while stack:
-        current_path = stack.pop()
-        stdout, stderr, rc = adb_run(["ls", current_path], timeout=60)
-        if rc != 0 or not stdout:
-            continue
-
-        for line in stdout.splitlines():
-            parts = line.split(maxsplit=3)
-            if len(parts) < 4:
+        scan_start = time.time()
+        stack = list(SCAN_PATHS)
+        while stack:
+            current_path = stack.pop()
+            stdout, stderr, rc = adb_run(["ls", current_path], timeout=60)
+            if rc != 0 or not stdout:
                 continue
-
-            mode_str, size_str, _, name = parts
-            if name in (".", ".."):
-                continue
-
-            full_path = f"{current_path.rstrip('/')}/{name}"
-            if full_path in seen_paths:
-                continue
-            seen_paths.add(full_path)
-
-            try:
-                mode = int(mode_str, 16)
-                size = int(size_str, 16)
-            except ValueError:
-                continue
-
-            if mode & 0o40000:  # Directory
-                stack.append(full_path)
-            elif mode & 0o100000:  # File
-                ext = os.path.splitext(name)[1].lower()
-                if ext in VALID_EXTENSIONS:
-                    # Skip file dengan Unicode/emoji di nama (silent, no log)
-                    if any(ord(ch) > 127 for ch in name):
-                        continue
-                    all_files.append({"path": full_path, "size": size, "name": name})
-
-    elapsed = time.time() - scan_start
-    if RICH_AVAILABLE:
-        console.print(f"       [green]Scan selesai dalam {elapsed:.1f} detik[/green]")
-        console.print(f"       [cyan]Total file media ditemukan: {len(all_files)}[/cyan]")
-    else:
+            for line in stdout.splitlines():
+                parts = line.split(maxsplit=3)
+                if len(parts) < 4:
+                    continue
+                mode_str, size_str, _, name = parts
+                if name in (".", ".."):
+                    continue
+                full_path = f"{current_path.rstrip('/')}/{name}"
+                if full_path in seen_paths:
+                    continue
+                seen_paths.add(full_path)
+                try:
+                    mode = int(mode_str, 16)
+                    size = int(size_str, 16)
+                except ValueError:
+                    continue
+                if mode & 0o40000:
+                    stack.append(full_path)
+                elif mode & 0o100000:
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext in VALID_EXTENSIONS:
+                        if any(ord(ch) > 127 for ch in name):
+                            continue
+                        all_files.append({"path": full_path, "size": size, "name": name})
+        elapsed = time.time() - scan_start
         print(f"       Scan selesai dalam {elapsed:.1f} detik")
         print(f"       Total file media ditemukan: {len(all_files)}")
     return all_files
-
-
 def get_existing_files(backup_dir):
     """Dapatkan set file yang sudah ada di backup (optimasi caching)."""
     existing = set()
@@ -335,9 +377,10 @@ def clean_zero_byte_files(root: str) -> int:
     return cleaned
 
 
-def pull_file_via_exec_out(remote_path, local_path, timeout=120):
+def pull_file_via_exec_out(remote_path, local_path, timeout=None, size_hint=0):
     """
     Pull file dari Android via adb exec-out dengan tar streaming.
+    Stream ke temp file di disk (bukan RAM) agar aman untuk file besar.
     Handle Unicode/emoji filenames via hex escape.
     
     Returns: (success: bool, transferred_bytes: int, error_msg: str)
@@ -363,12 +406,13 @@ def pull_file_via_exec_out(remote_path, local_path, timeout=120):
                 break
 
     if not actual_filename:
-        return False, 0, f"File not found in directory listing"
+        return False, 0, "File not found in directory listing"
 
     # Step 2: Write filename ke temp file dengan hex escapes
     fname_bytes = actual_filename.encode('utf-8')
     hex_escapes = ''.join(f'\\x{b:02x}' for b in fname_bytes)
-    temp_fname_path = f"/data/local/tmp/backup_fname_{int(time.time() * 1000)}.txt"
+    ts = int(time.time() * 1000)
+    temp_fname_path = f"/data/local/tmp/backup_fname_{ts}.txt"
 
     write_cmd = f"echo -ne '{hex_escapes}' > {temp_fname_path}"
     result = subprocess.run(
@@ -378,12 +422,29 @@ def pull_file_via_exec_out(remote_path, local_path, timeout=120):
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if result.returncode != 0:
-        err = result.stderr.decode('utf-8', errors='replace')[:100]
-        return False, 0, f"Write filename failed: {err}"
+        # Fallback: coba pakai /sdcard/
+        temp_fname_path = f"/sdcard/backup_temp_{ts}.txt"
+        write_cmd = f"echo -ne '{hex_escapes}' > {temp_fname_path}"
+        result = subprocess.run(
+            [ADB_PATH, "exec-out", write_cmd],
+            capture_output=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            err = result.stderr.decode('utf-8', errors='replace')[:100]
+            return False, 0, f"Write filename failed: {err}"
 
-    # Step 3: Tar streaming
-    escaped_parent = parent_dir.replace("'", "'\\\\''")
+    # Step 3: Tar streaming langsung ke temp file di PC
+    escaped_parent = parent_dir.replace("'", "'\\''")
     tar_cmd = f"cd '{escaped_parent}' && tar -cf - --files-from={temp_fname_path}"
+
+    # Timeout dinamis: minimal 60s + 30s per 100MB
+    if timeout is None:
+        timeout = max(60, 60 + int(size_hint / (100 * 1024 * 1024) * 30))
+
+    temp_tar = f"{local_path}.tar.tmp"
+    os.makedirs(os.path.dirname(temp_tar), exist_ok=True)
 
     try:
         proc = subprocess.Popen(
@@ -392,9 +453,20 @@ def pull_file_via_exec_out(remote_path, local_path, timeout=120):
             stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        tar_data, stderr_data = proc.communicate(timeout=timeout)
 
-        # Cleanup temp
+        # Stream tar ke temp file — chunk-by-chunk, TIDAK di RAM
+        transferred = 0
+        with open(temp_tar, 'wb') as tf:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                tf.write(chunk)
+                transferred += len(chunk)
+
+        proc.wait(timeout=timeout)
+
+        # Cleanup temp file di HP
         subprocess.run(
             [ADB_PATH, "exec-out", f"rm -f {temp_fname_path}"],
             capture_output=True,
@@ -403,32 +475,70 @@ def pull_file_via_exec_out(remote_path, local_path, timeout=120):
         )
 
         if proc.returncode != 0:
-            err = stderr_data.decode('utf-8', errors='replace')[:200] if stderr_data else "unknown"
-            return False, 0, f"tar exit code {proc.returncode}: {err}"
+            stderr_data = proc.stderr.read().decode('utf-8', errors='replace')[:200] if proc.stderr else "unknown"
+            try:
+                os.remove(temp_tar)
+            except:
+                pass
+            return False, 0, f"tar exit code {proc.returncode}: {stderr_data}"
 
-        if not tar_data or len(tar_data) < 512:
-            return False, 0, f"tar output too small: {len(tar_data) if tar_data else 0} bytes"
+        if transferred < 512:
+            try:
+                os.remove(temp_tar)
+            except:
+                pass
+            return False, 0, f"tar output too small: {transferred} bytes"
 
-        # Extract from tar stream
-        tar_stream = io.BytesIO(tar_data)
-        with tarfile.open(fileobj=tar_stream, mode='r') as tar:
+        # Extract dari temp tar file — chunk-by-chunk
+        extracted_size = 0
+        with tarfile.open(temp_tar, 'r') as tar:
             members = tar.getmembers()
             if not members:
+                try:
+                    os.remove(temp_tar)
+                except:
+                    pass
                 return False, 0, "tar archive empty"
             member = members[0]
-            file_data = tar.extractfile(member)
-            if file_data is None:
+            source = tar.extractfile(member)
+            if source is None:
+                try:
+                    os.remove(temp_tar)
+                except:
+                    pass
                 return False, 0, "cannot extract file from tar"
-            file_content = file_data.read()
 
-        # Write to destination
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        with open(local_path, 'wb') as f:
-            f.write(file_content)
+            with open(local_path, 'wb') as f:
+                while True:
+                    chunk = source.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    extracted_size += len(chunk)
 
-        return True, len(file_content), ""
+        # Hapus temp tar
+        try:
+            os.remove(temp_tar)
+        except:
+            pass
+
+        return True, extracted_size, ""
+    except MemoryError:
+        try:
+            os.remove(temp_tar)
+        except:
+            pass
+        try:
+            os.remove(local_path)
+        except:
+            pass
+        return False, 0, "MEMORY ERROR: File terlalu besar untuk diproses"
     except Exception as e:
-        # Cleanup on error
+        try:
+            os.remove(temp_tar)
+        except:
+            pass
+        # Cleanup temp file di HP
         subprocess.run(
             [ADB_PATH, "exec-out", f"rm -f {temp_fname_path}"],
             capture_output=True,
@@ -596,7 +706,8 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
 
                     # Pakai tar streaming untuk SEMUA file (reliable untuk binary)
                     ok, transferred, err = pull_file_via_exec_out(
-                        remote_path, local_path
+                        remote_path, local_path,
+                        size_hint=item.get("size") or 0,
                     )
 
                     if ok:
@@ -608,29 +719,35 @@ def copy_with_progress_rich(media_files, new_folders, total_new_size, existing_p
                             adb_run(["shell", f'rm "{e_remote}"'], timeout=10)
                     else:
                         failed += 1
+                        console.print(f"  [red]✗ Gagal:[/red] {filename}")
+                        console.print(f"    [dim]Alasan: {err}[/dim]")
 
                     folder_progress.advance(folder_task, 1)
                     overall_progress.advance(overall_task, transferred)
 
-    summary = f"""
-[{'=' * 60}]
-  LAPORAN BACKUP
-[{'=' * 60}]
-  Mode         : {copy_mode}
-  Berhasil     : {success}
-  Gagal        : {failed}
-  Dilewati     : {skipped}
-  Total        : {total_files}
-  Ukuran       : {format_size(total_transferred)}
-[{'=' * 60}]
-"""
-    console.print(summary)
-
-    if failed == 0:
-        console.print("\n[green][SUKSES][/green] Semua file berhasil dicadangkan!")
+    # Rich summary panel
+    if success == total_files:
+        status_color = "green"
+        status_icon = "✓"
+    elif failed > 0:
+        status_color = "red"
+        status_icon = "✗"
     else:
-        if failed > 0:
-            console.print(f"[red][WARN][/red] {failed} file gagal dicadangkan.")
+        status_color = "yellow"
+        status_icon = "⚠"
+
+    panel_content = (
+        f"  [bold]Mode         :[/bold] [cyan]{copy_mode.upper()}[/cyan]\n"
+        f"  [bold]Berhasil     :[/bold] [green]{success}[/green]\n"
+    )
+    if failed:
+        panel_content += f"  [bold]Gagal        :[/bold] [red]{failed}[/red]\n"
+    panel_content += (
+        f"  [bold]Dilewati     :[/bold] [yellow]{skipped}[/yellow]\n"
+        f"  [bold]Total        :[/bold] [white]{total_files}[/white]\n"
+        f"  [bold]Ukuran       :[/bold] [cyan]{format_size(total_transferred)}[/cyan]"
+    )
+    console.print(Panel.fit(panel_content, title=f"[bold {status_color}]{status_icon} Laporan Backup[/bold {status_color}]", border_style=status_color))
 
 
 def clear_line():
@@ -714,15 +831,29 @@ def print_folder_summary(folders):
 def select_folders(folders_dict):
     """Pilih folder tertentu untuk backup."""
     sorted_folders = sorted(folders_dict.items(), key=lambda x: len(x[1]), reverse=True)
-    print(f"\n{'=' * 60}")
-    print("  PILIH FOLDER UNTUK BACKUP")
-    print(f"{'=' * 60}")
-    for idx, (folder, files) in enumerate(sorted_folders, 1):
-        total_size = sum(f["size"] for f in files if f["size"] is not None)
-        display_folder = folder.replace(DEVICE_MOUNT_POINT + "/", "/")
-        print(f"  {idx:2d}. [{len(files):3d} file] {format_size(total_size):>10s}  {display_folder}")
-    print(f"  0.   Kembali (semua folder)")
-    print(f"{'=' * 60}")
+    if RICH_AVAILABLE:
+        table = Table(title="Pilih Folder Untuk Backup", border_style="cyan")
+        table.add_column("#", style="dim")
+        table.add_column("File", justify="right")
+        table.add_column("Ukuran", justify="right")
+        table.add_column("Folder")
+        table.add_column("", style="dim")  # untuk 0 = kembali
+        for idx, (folder, files) in enumerate(sorted_folders, 1):
+            total_size = sum(f["size"] for f in files if f["size"] is not None)
+            display_folder = folder.replace(DEVICE_MOUNT_POINT + "/", "/")
+            table.add_row(str(idx), str(len(files)), format_size(total_size), display_folder, "")
+        table.add_row("0", "", "", "Kembali (semua folder)", "")
+        console.print(table)
+    else:
+        print(f"\n{'=' * 60}")
+        print("  PILIH FOLDER UNTUK BACKUP")
+        print(f"{'=' * 60}")
+        for idx, (folder, files) in enumerate(sorted_folders, 1):
+            total_size = sum(f["size"] for f in files if f["size"] is not None)
+            display_folder = folder.replace(DEVICE_MOUNT_POINT + "/", "/")
+            print(f"  {idx:2d}. [{len(files):3d} file] {format_size(total_size):>10s}  {display_folder}")
+        print(f"  0.   Kembali (semua folder)")
+        print(f"{'=' * 60}")
     while True:
         choice = input(
             "\n  Masukkan nomor folder (pisah dengan koma, contoh: 1,3,5) atau '0' untuk semua: "
@@ -797,7 +928,10 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
                 continue
 
             # Pakai tar streaming untuk SEMUA file (reliable untuk binary)
-            ok, transferred, err = pull_file_via_exec_out(remote_path, local_path)
+            ok, transferred, err = pull_file_via_exec_out(
+                remote_path, local_path,
+                size_hint=item.get("size") or 0,
+            )
 
             if ok:
                 used_paths.add(safe_names.norm_path(local_path))
@@ -822,6 +956,7 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
                     adb_run(["shell", f'rm "{e_remote}"'], timeout=10)
             else:
                 print(f"\n[ERROR] Gagal: {filename}")
+                print(f"        Alasan: {err}")
                 failed += 1
 
     draw_folder_progress(100, 100, "SELESAI", len(sorted_folders), len(sorted_folders),
@@ -848,10 +983,15 @@ def copy_with_progress_fallback(media_files, new_folders, total_new_size, existi
 
 def run_backup(device_id):
     """Jalankan seluruh proses backup dengan optimasi dan rich.progress."""
-    print(f"\n{'=' * 60}")
-    print(f"  Device    : {device_id}")
-    print(f"  Backup To : {PC_BACKUP_DIR}")
-    print(f"{'=' * 60}")
+    if RICH_AVAILABLE:
+        console.rule(f"[bold cyan]Device: {device_id}[/bold cyan]", style="blue")
+        console.print(f"  [dim]Backup To:[/dim] [white]{PC_BACKUP_DIR}[/white]")
+        console.print()
+    else:
+        print(f"\n{'=' * 60}")
+        print(f"  Device    : {device_id}")
+        print(f"  Backup To : {PC_BACKUP_DIR}")
+        print(f"{'=' * 60}")
 
     # Phase 1: Scan
     all_media = adb_list_files_recursive()
@@ -873,42 +1013,72 @@ def run_backup(device_id):
     new_folders = group_by_folder(new_files)
     print_folder_summary(new_folders)
 
-    print(f"\n{'=' * 60}")
-    print("  RINGKASAN BACKUP")
-    print(f"{'=' * 60}")
-    print(f"  Total file media di HP   : {len(all_media)}")
-    print(f"  File baru (belum backup) : {len(new_files)}")
-    print(f"  File duplikat            : {dup_count}")
-    print(f"  Total ukuran baru        : {format_size(total_new_size)}")
-    print(f"  Lokasi backup            : {PC_BACKUP_DIR}")
-    print(f"  Folder dengan media baru : {len(new_folders)}")
-    print(f"{'=' * 60}")
+    if RICH_AVAILABLE:
+        console.rule("[bold cyan]Ringkasan Backup[/bold cyan]", style="blue")
+        summary = (
+            f"  [white]Total file media di HP   :[/white] [cyan]{len(all_media)}[/cyan]\n"
+            f"  [white]File baru (belum backup) :[/white] [green]{len(new_files)}[/green]\n"
+            f"  [white]File duplikat            :[/white] [yellow]{dup_count}[/yellow]\n"
+            f"  [white]Total ukuran baru        :[/white] [green]{format_size(total_new_size)}[/green]\n"
+            f"  [white]Lokasi backup            :[/white] [white]{PC_BACKUP_DIR}[/white]\n"
+            f"  [white]Folder dengan media baru :[/white] [cyan]{len(new_folders)}[/cyan]"
+        )
+        console.print(summary)
+        console.print()
+    else:
+        print(f"\n{'=' * 60}")
+        print("  RINGKASAN BACKUP")
+        print(f"{'=' * 60}")
+        print(f"  Total file media di HP   : {len(all_media)}")
+        print(f"  File baru (belum backup) : {len(new_files)}")
+        print(f"  File duplikat            : {dup_count}")
+        print(f"  Total ukuran baru        : {format_size(total_new_size)}")
+        print(f"  Lokasi backup            : {PC_BACKUP_DIR}")
+        print(f"  Folder dengan media baru : {len(new_folders)}")
+        print(f"{'=' * 60}")
 
     if not new_files:
         print("\n[TIDAK ADA FILE BARU] Semua file sudah tercadangkan.")
         return
 
     # Phase 3: Pilih mode
-    print(f"\n{'=' * 60}")
-    print("  MODE TRANSFER")
-    print(f"{'=' * 60}")
-    print(f"  C. COPY  - Salin file (tetap ada di HP)")
-    print(f"  M. MOVE  - Pindah file (dihapus dari HP setelah backup)")
-    print(f"{'=' * 60}")
+    if RICH_AVAILABLE:
+        console.rule("[bold cyan]Mode Transfer[/bold cyan]", style="blue")
+        console.print("  [green]C[/green]. COPY  - Salin file (tetap ada di HP)")
+        console.print("  [yellow]M[/yellow]. MOVE  - Pindah file (dihapus dari HP setelah backup)")
+    else:
+        print(f"\n{'=' * 60}")
+        print("  MODE TRANSFER")
+        print(f"{'=' * 60}")
+        print(f"  C. COPY  - Salin file (tetap ada di HP)")
+        print(f"  M. MOVE  - Pindah file (dihapus dari HP setelah backup)")
+        print(f"{'=' * 60}")
     while True:
         mode_choice = input("\n  Pilih mode [C/M]: ").strip().upper()
         if mode_choice in ("C", "M"):
             copy_mode = "move" if mode_choice == "M" else "copy"
             break
-        print("  Input tidak valid. Pilih C atau M.")
+        if RICH_AVAILABLE:
+            console.print("  [red]Input tidak valid. Pilih C atau M.[/red]")
+        else:
+            print("  Input tidak valid. Pilih C atau M.")
 
     mode_label = "PINDAH (MOVE)" if copy_mode == "move" else "SALIN (COPY)"
-    print(f"\n[MODE] {mode_label}")
+    if RICH_AVAILABLE:
+        console.print(f"\n  [bold]Mode:[/bold] [cyan]{mode_label}[/cyan]")
+    else:
+        print(f"\n[MODE] {mode_label}")
 
-    print("\n[PILIHAN]")
-    print("  A. Backup SEMUA folder")
-    print("  B. Pilih folder tertentu")
-    print("  C. Batalkan")
+    if RICH_AVAILABLE:
+        console.rule("[bold cyan]Pilihan Folder[/bold cyan]", style="blue")
+        console.print("  [green]A[/green]. Backup SEMUA folder")
+        console.print("  [yellow]B[/yellow]. Pilih folder tertentu")
+        console.print("  [red]C[/red]. Batalkan")
+    else:
+        print("\n[PILIHAN]")
+        print("  A. Backup SEMUA folder")
+        print("  B. Pilih folder tertentu")
+        print("  C. Batalkan")
     while True:
         choice = input("\n  Pilih [A/B/C]: ").strip().upper()
         if choice == "A":
@@ -922,14 +1092,23 @@ def run_backup(device_id):
             for files in new_folders.values():
                 new_files.extend(files)
             if not new_files:
-                print("\n[TIDAK ADA FILE] Tidak ada file yang dipilih.")
+                if RICH_AVAILABLE:
+                    console.print("  [red]Tidak ada file yang dipilih.[/red]")
+                else:
+                    print("\n[TIDAK ADA FILE] Tidak ada file yang dipilih.")
                 return
             break
         elif choice == "C":
-            print("\n[BATAL] Backup dibatalkan.")
+            if RICH_AVAILABLE:
+                console.print("  [red]Backup dibatalkan.[/red]")
+            else:
+                print("\n[ BATAL ] Backup dibatalkan.")
             return
         else:
-            print("  Input tidak valid. Pilih A, B, atau C.")
+            if RICH_AVAILABLE:
+                console.print("  [red]Input tidak valid. Pilih A, B, atau C.[/red]")
+            else:
+                print("  Input tidak valid. Pilih A, B, atau C.")
 
     total_new_size = sum(f["size"] for f in new_files if f["size"] is not None)
     used_paths = set()
